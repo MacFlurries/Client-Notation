@@ -512,6 +512,35 @@
         color: var(--text-muted);
       }
 
+      /* In-page Dialog (replaces native confirm/prompt/alert, which are
+         blocked or throw inside sandboxed iframes / embedded previews) */
+      .dialog-content {
+        max-width: 420px;
+      }
+      .dialog-message {
+        margin-bottom: 1rem;
+        color: var(--text-main);
+        white-space: pre-wrap;
+      }
+      .dialog-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 0.5rem;
+        margin-top: 1rem;
+      }
+      .dialog-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+        margin-bottom: 1rem;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+      .dialog-list button {
+        text-align: left;
+        width: 100%;
+      }
+
       /* Checkzer Panel */
       #checkzer-panel {
         display: none;
@@ -913,6 +942,25 @@
       </div>
     </div>
 
+    <!-- Generic Dialog (replaces native confirm/prompt/alert) -->
+    <div id="modal-dialog" class="modal-overlay">
+      <div class="modal-content dialog-content">
+        <h2 id="dialog-title">Confirm</h2>
+        <div id="dialog-message" class="dialog-message"></div>
+        <div id="dialog-list" class="dialog-list hidden"></div>
+        <input
+          type="text"
+          id="dialog-input"
+          class="hidden"
+          autocomplete="off"
+        />
+        <div class="dialog-actions">
+          <button id="dialog-cancel">Cancel</button>
+          <button id="dialog-ok" class="primary">OK</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Checkzer Panel -->
     <div
       id="checkzer-container"
@@ -1010,6 +1058,91 @@
 
       const execCmd = (command, value = null) => {
         document.execCommand(command, false, value);
+      };
+
+      // --- In-page Dialog (replaces window.confirm/prompt/alert) ---
+      // Native confirm()/prompt()/alert() are blocked (throw or no-op) inside
+      // sandboxed iframes without "allow-modals", which many embedded
+      // previews and cross-site viewers use. This dialog works everywhere.
+      const Dialog = {
+        _resolve: null,
+        init: () => {
+          document
+            .getElementById("dialog-cancel")
+            .addEventListener("click", () => Dialog._close(null));
+          document
+            .getElementById("dialog-ok")
+            .addEventListener("click", () => Dialog._submitOk());
+          document
+            .getElementById("modal-dialog")
+            .addEventListener("click", (e) => {
+              if (e.target.id === "modal-dialog") Dialog._close(null);
+            });
+          document
+            .getElementById("dialog-input")
+            .addEventListener("keydown", (e) => {
+              if (e.key === "Enter") Dialog._submitOk();
+              if (e.key === "Escape") Dialog._close(null);
+            });
+        },
+        _open: (title, message) => {
+          document.getElementById("dialog-title").textContent = title;
+          document.getElementById("dialog-message").textContent = message;
+          document.getElementById("modal-dialog").classList.add("active");
+        },
+        _close: (result) => {
+          document.getElementById("modal-dialog").classList.remove("active");
+          document.getElementById("dialog-input").classList.add("hidden");
+          document.getElementById("dialog-list").classList.add("hidden");
+          document.getElementById("dialog-list").innerHTML = "";
+          document.getElementById("dialog-cancel").classList.remove("hidden");
+          document.getElementById("dialog-ok").classList.remove("hidden");
+          if (Dialog._resolve) {
+            const r = Dialog._resolve;
+            Dialog._resolve = null;
+            r(result);
+          }
+        },
+        _submitOk: () => {
+          const input = document.getElementById("dialog-input");
+          if (!input.classList.contains("hidden")) Dialog._close(input.value);
+          else Dialog._close(true);
+        },
+        confirm: (message, title = "Please confirm") =>
+          new Promise((resolve) => {
+            Dialog._resolve = resolve;
+            Dialog._open(title, message);
+          }),
+        prompt: (message, defaultValue = "", title = "Input needed") =>
+          new Promise((resolve) => {
+            Dialog._resolve = resolve;
+            Dialog._open(title, message);
+            const input = document.getElementById("dialog-input");
+            input.classList.remove("hidden");
+            input.value = defaultValue;
+            setTimeout(() => input.focus(), 50);
+          }),
+        alert: (message, title = "Notice") =>
+          new Promise((resolve) => {
+            Dialog._resolve = resolve;
+            document.getElementById("dialog-cancel").classList.add("hidden");
+            Dialog._open(title, message);
+          }),
+        // options: [{ label, value }]
+        choose: (message, options, title = "Choose") =>
+          new Promise((resolve) => {
+            Dialog._resolve = resolve;
+            Dialog._open(title, message);
+            document.getElementById("dialog-ok").classList.add("hidden");
+            const list = document.getElementById("dialog-list");
+            list.classList.remove("hidden");
+            options.forEach((opt) => {
+              const btn = document.createElement("button");
+              btn.textContent = opt.label;
+              btn.addEventListener("click", () => Dialog._close(opt.value));
+              list.appendChild(btn);
+            });
+          }),
       };
 
       // --- Save status indicator ---
@@ -1318,6 +1451,7 @@
       const UI = {
         init: () => {
           Storage.load();
+          Dialog.init();
           setSaveStatus("saved");
           if (!window.showSaveFilePicker) {
             const btn = document.getElementById("btn-connect-file");
@@ -1687,9 +1821,9 @@
             .join("");
         },
 
-        deleteCurrent: () => {
+        deleteCurrent: async () => {
           if (!currentItem) return;
-          if (confirm("Move this item to trash?")) {
+          if (await Dialog.confirm("Move this item to trash?")) {
             currentItem.deleted = true;
             triggerAutosave(currentItem);
             UI.renderSidebarList();
@@ -1745,26 +1879,21 @@
 
       // --- Action Handlers ---
       const Handlers = {
-        newEntry: (type) => {
+        newEntry: async (type) => {
           let clientId = null;
-          if (
-            (type === "standup" || type === "sprint") &&
-            state.clients.filter((c) => !c.deleted).length > 0
-          ) {
-            const clients = state.clients.filter((c) => !c.deleted);
-            const menu = clients
-              .map((c, i) => `${i + 1}: ${c.name}`)
-              .join("\n");
-            const choice = prompt(
-              `Link to client (enter number):\n${menu}\n\nOr leave blank to skip.`,
+          const activeClients = state.clients.filter((c) => !c.deleted);
+          if ((type === "standup" || type === "sprint") && activeClients.length > 0) {
+            const choice = await Dialog.choose(
+              "Link this entry to a client, or Cancel to skip.",
+              activeClients.map((c) => ({ label: c.name, value: c.id })),
+              "Link to client",
             );
-            if (choice && !isNaN(choice) && clients[choice - 1])
-              clientId = clients[choice - 1].id;
+            if (choice) clientId = choice;
           } else if (
             (type === "standup" || type === "sprint") &&
-            state.clients.filter((c) => !c.deleted).length === 0
+            activeClients.length === 0
           ) {
-            alert(
+            await Dialog.alert(
               "Please create a client in the Clients tab first to use this template properly.",
             );
             return;
@@ -1810,9 +1939,9 @@
           UI.renderEntryEditor(currentItem);
           triggerAutosave(currentItem);
         },
-        deleteSection: (entryId, sectionId) => {
+        deleteSection: async (entryId, sectionId) => {
           if (currentItem.id !== entryId) return;
-          if (confirm("Remove this section?")) {
+          if (await Dialog.confirm("Remove this section?")) {
             currentItem.sections = currentItem.sections.filter(
               (s) => s.id !== sectionId,
             );
@@ -1869,10 +1998,12 @@
             UI.renderEntryEditor(entry);
           }
         },
-        revertHistory: (idx) => {
+        revertHistory: async (idx) => {
           if (!currentItem || !currentItem.history[idx]) return;
           if (
-            confirm("Revert to this snapshot? unsaved changes will be lost.")
+            await Dialog.confirm(
+              "Revert to this snapshot? unsaved changes will be lost.",
+            )
           ) {
             Object.assign(currentItem, currentItem.history[idx].data);
             triggerAutosave(currentItem);
@@ -1890,8 +2021,8 @@
           else UI.renderEntryEditor(item);
           showToast("Item restored", "success");
         },
-        permanentDelete: (item) => {
-          if (confirm("Permanently delete? This CANNOT be undone.")) {
+        permanentDelete: async (item) => {
+          if (await Dialog.confirm("Permanently delete? This CANNOT be undone.")) {
             if (item.name)
               state.clients = state.clients.filter((c) => c.id !== item.id);
             else state.entries = state.entries.filter((e) => e.id !== item.id);
@@ -1900,8 +2031,8 @@
             UI.showEmpty();
           }
         },
-        addChecklistItem: (clientId) => {
-          const label = prompt("Enter the title for the new section:");
+        addChecklistItem: async (clientId) => {
+          const label = await Dialog.prompt("Enter the title for the new section:");
           if (!label || !label.trim()) return;
 
           const client =
