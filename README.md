@@ -1,4 +1,4 @@
-dir-dairi is a lightweight, frontend-driven web application designed to **track team standups**, sprint requirements, and dairy operations data through a clean, manually inputted interface. Built for simplicity, it allows teams to manage records directly without the friction of heavy backend databases.
+**Client Notation** is a lightweight, frontend-driven web application designed to **track team standups**, sprint requirements, and dairy operations data through a clean, manually inputted interface. Built for simplicity, it allows teams to manage records directly without the friction of heavy backend databases.
 
 **Key Features & What's Inside**
 - Client Management: Dedicated sections for handling client records, updated in V1.1 with a brand-new layout section and a robust fix for soft-delete functionalities to ensure data integrity.
