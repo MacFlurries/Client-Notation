@@ -1,0 +1,20 @@
+# --- Reverse .gitignore: ignore everything, then allow-list only what's needed ---
+# Ignore everything by default
+*
+
+# But do look inside directories (needed so Git can find allow-listed files
+# that live in subfolders). Harmless if everything is at repo root.
+!*/
+
+# Allow-list: only these files are tracked/pushed
+*
+!*/
+!/Client-Notation.html
+!/LICENSE
+!/README.md
+!/README
+!/.gitignore
+
+# Still ignore this file itself only if you don't want .gitignore tracked;
+# remove the line below if you DO want .gitignore committed too.
+# !/.gitignore

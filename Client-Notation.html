@@ -789,7 +789,9 @@
     <!-- SIDEBAR -->
     <aside id="sidebar">
       <div class="sidebar-header">
-        <h2 style="margin: 0 0 1rem 0; font-size: 1.25rem">Vla's dir dair</h2>
+        <h2 style="margin: 0 0 1rem 0; font-size: 1.25rem">
+          Vla's Client Notes
+        </h2>
         <div class="nav-tabs">
           <div class="nav-tab active" data-view="diary">Diary</div>
           <div class="nav-tab" data-view="clients">Clients</div>
@@ -838,11 +840,12 @@
           ⚙️ Settings
         </button>
         <button
-          data-action="openStorageFolder"
+          data-action="manageStorage"
+          id="btn-manage-storage"
           class="icon-btn"
-          title="See Uploaded Files Directory"
+          title="Link Upload Folder"
         >
-          📁 See Uploaded Files
+          📁 Link Upload Folder
         </button>
         <button data-action="toggleCheckzer" class="primary" style="flex: 1">
           ✨ Checkzer
@@ -1026,6 +1029,24 @@
             id="connected-file-label"
             class="text-sm text-muted hidden"
           ></span>
+        </div>
+        <h4 class="mt-4" style="margin-bottom: 0.5rem; font-size: 0.95rem">
+          Local Media Storage
+        </h4>
+        <div class="flex-row mb-4">
+          <button data-action="manageStorage" id="btn-settings-link-folder">
+            📁 Link to new Folder
+          </button>
+          <button
+            data-action="unlinkStorage"
+            id="btn-settings-unlink-folder"
+            class="hidden danger"
+          >
+            Unlink Folder
+          </button>
+          <span id="settings-folder-status" class="text-sm text-muted"
+            >Not linked</span
+          >
         </div>
         <div class="flex-row mt-4 mb-4">
           <button data-action="exportData">💾 Export Data (.json)</button>
@@ -1257,42 +1278,252 @@
         },
       };
 
+      // --- IndexedDB for persisting the linked Directory Handle across reloads ---
+      const DirHandleDB = {
+        dbName: "DocDiaryDirHandleDB",
+        storeName: "dir_handle",
+        db: null,
+        init: function () {
+          return new Promise((resolve, reject) => {
+            if (this.db) return resolve(this.db);
+            const request = indexedDB.open(this.dbName, 1);
+            request.onupgradeneeded = (e) => {
+              const db = e.target.result;
+              if (!db.objectStoreNames.contains(this.storeName)) {
+                db.createObjectStore(this.storeName);
+              }
+            };
+            request.onsuccess = (e) => {
+              this.db = e.target.result;
+              resolve(this.db);
+            };
+            request.onerror = (e) => reject(e);
+          });
+        },
+        save: async function (handle) {
+          const db = await this.init();
+          return new Promise((resolve, reject) => {
+            const tx = db.transaction([this.storeName], "readwrite");
+            tx.objectStore(this.storeName).put(handle, "current");
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = (e) => reject(e);
+          });
+        },
+        get: async function () {
+          const db = await this.init();
+          return new Promise((resolve) => {
+            const tx = db.transaction([this.storeName], "readonly");
+            const req = tx.objectStore(this.storeName).get("current");
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+          });
+        },
+        clear: async function () {
+          const db = await this.init();
+          return new Promise((resolve) => {
+            const tx = db.transaction([this.storeName], "readwrite");
+            tx.objectStore(this.storeName).delete("current");
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          });
+        },
+      };
+
+      // Finds every <img data-saved-path> inside a freshly-rendered container whose
+        // src is a stale/dead blob: URL, and re-resolves it from the linked folder.
+        async function reviveSavedImages(container) {
+          const imgs = container.querySelectorAll("img[data-saved-path]");
+          for (const img of imgs) {
+            const path = img.dataset.savedPath;
+            if (!path) continue;
+            if (img.src.startsWith("blob:") && img.complete && img.naturalWidth > 0) continue; // still alive
+            const freshUrl = await DirectoryStore.getFileURL(path);
+            if (freshUrl) {
+              img.src = freshUrl;
+            } else {
+              img.alt = `⚠️ ${img.alt} (folder not linked — reconnect to view)`;
+            }
+          }
+        }
+
       // --- Local Storage & File Inspector Manager ---
       const DirectoryStore = {
         dirHandle: null,
+        pendingHandle: null, // known from a previous session, but permission not yet re-confirmed
 
-        // Membuka direktori penyimpanan yang sudah dihubungkan
-        openStorageFolder: async function() {
+        verifyPermission: async function (fileHandle, readWrite = true) {
+          if (!fileHandle) return false;
+          const options = { mode: readWrite ? "readwrite" : "read" };
+          if ((await fileHandle.queryPermission(options)) === "granted")
+            return true;
+          if ((await fileHandle.requestPermission(options)) === "granted")
+            return true;
+          return false;
+        },
+
+        // Called once on app load. Silently checks (no permission prompt — that needs
+        // a user gesture) whether a previously linked folder is still usable.
+        restore: async function () {
           try {
-            if (!this.dirHandle) {
-              // Jika belum pernah dipilih, minta pengguna memilih folder Client-Notation
-              showToast("Select your Client-Notation storage folder", "info");
-              this.dirHandle = await window.showDirectoryPicker();
+            const handle = await DirHandleDB.get();
+            if (!handle) return;
+            const granted = await handle.queryPermission({ mode: "readwrite" });
+            if (granted === "granted") {
+              this.dirHandle = handle;
             } else {
-              // Jika sudah ada, minta re-verify akses atau re-select untuk melihat file
-              this.dirHandle = await window.showDirectoryPicker({
-                startIn: this.dirHandle
-              });
+              this.pendingHandle = handle; // needs a click to re-confirm permission
             }
-            showToast("Directory accessed successfully!", "success");
+            this.updateUI();
           } catch (err) {
-            if (err.name !== 'AbortError') {
-              showToast("Unable to open folder: " + err.message, "error");
+            console.error("Failed to restore linked folder:", err);
+          }
+        },
+
+        updateUI: function () {
+          const sidebarBtn = document.getElementById("btn-manage-storage");
+          const settingsLinkBtn = document.getElementById(
+            "btn-settings-link-folder",
+          );
+          const settingsUnlinkBtn = document.getElementById(
+            "btn-settings-unlink-folder",
+          );
+          const settingsStatus = document.getElementById(
+            "settings-folder-status",
+          );
+
+          if (this.dirHandle) {
+            if (sidebarBtn) {
+              sidebarBtn.innerHTML = "📁 See Uploaded Files";
+              sidebarBtn.title = "Open Local Directory";
+            }
+            if (settingsLinkBtn) settingsLinkBtn.classList.add("hidden");
+            if (settingsUnlinkBtn) settingsUnlinkBtn.classList.remove("hidden");
+            if (settingsStatus)
+              settingsStatus.textContent = `Linked: ${this.dirHandle.name}`;
+          } else if (this.pendingHandle) {
+            if (sidebarBtn) {
+              sidebarBtn.innerHTML = "📁 Reconnect Folder";
+              sidebarBtn.title = "Click to reconnect linked folder";
+            }
+            if (settingsLinkBtn) settingsLinkBtn.classList.remove("hidden");
+            if (settingsUnlinkBtn) settingsUnlinkBtn.classList.remove("hidden");
+            if (settingsStatus)
+              settingsStatus.textContent = `Linked: ${this.pendingHandle.name} (click to reconnect)`;
+          } else {
+            if (sidebarBtn) {
+              sidebarBtn.innerHTML = "📁 Link Upload Folder";
+              sidebarBtn.title = "Link Upload Folder";
+            }
+            if (settingsLinkBtn) settingsLinkBtn.classList.remove("hidden");
+            if (settingsUnlinkBtn) settingsUnlinkBtn.classList.add("hidden");
+            if (settingsStatus) settingsStatus.textContent = "Not linked";
+          }
+        },
+
+        linkFolder: async function (showPrompt = true) {
+          try {
+            if (showPrompt) {
+              await Dialog.alert(
+                "To save images and PDFs securely on your machine, please select or create a local storage folder next.",
+              );
+            }
+            this.dirHandle = await window.showDirectoryPicker();
+            this.pendingHandle = null;
+            await DirHandleDB.save(this.dirHandle);
+            this.updateUI();
+            showToast("Folder linked successfully!", "success");
+            return true;
+          } catch (err) {
+            if (err.name !== "AbortError") {
+              showToast("Unable to link folder: " + err.message, "error");
+            }
+            return false;
+          }
+        },
+
+        unlinkFolder: function () {
+          this.dirHandle = null;
+          this.pendingHandle = null;
+          DirHandleDB.clear();
+          this.updateUI();
+          showToast("Upload folder unlinked.", "info");
+        },
+
+        manageStorage: async function () {
+          // Known folder from a previous session — just needs the permission re-confirmed.
+          if (this.pendingHandle && !this.dirHandle) {
+            try {
+              const granted = await this.pendingHandle.requestPermission({
+                mode: "readwrite",
+              });
+              if (granted === "granted") {
+                this.dirHandle = this.pendingHandle;
+                this.pendingHandle = null;
+                this.updateUI();
+                showToast("Folder reconnected!", "success");
+              } else {
+                showToast("Permission denied. Please relink.", "error");
+              }
+            } catch (err) {
+              showToast("Unable to reconnect folder: " + err.message, "error");
+            }
+            return;
+          }
+          if (!this.dirHandle) {
+            await this.linkFolder(true);
+          } else {
+            try {
+              const hasPerm = await this.verifyPermission(this.dirHandle);
+              if (!hasPerm) {
+                showToast("Folder access lost. Please relink.", "error");
+                this.unlinkFolder();
+                return;
+              }
+              await window.showOpenFilePicker({
+                startIn: this.dirHandle,
+                id: "viewFiles",
+              });
+            } catch (err) {
+              if (
+                err.name === "NotFoundError" ||
+                err.message.includes("not found")
+              ) {
+                showToast(
+                  "Linked folder was moved or deleted. Please relink.",
+                  "error",
+                );
+                this.unlinkFolder();
+              }
             }
           }
         },
 
         // Menyimpan berkas otomatis ke subfolder Client-Notation/images atau Client-Notation/pdfs
-        saveFileToDirectory: async function(file, category) {
+        saveFileToDirectory: async function (file, category) {
           if (!this.dirHandle) return null;
 
           try {
-            const subDirName = category === 'pdf' ? 'pdfs' : 'images';
-            const subDirHandle = await this.dirHandle.getDirectoryHandle(subDirName, { create: true });
+            const hasPerm = await this.verifyPermission(this.dirHandle);
+            if (!hasPerm) {
+              showToast(
+                "Lost permission to storage folder. Please link again.",
+                "error",
+              );
+              this.unlinkFolder();
+              return null;
+            }
+
+            const subDirName = category === "pdf" ? "pdfs" : "images";
+            const subDirHandle = await this.dirHandle.getDirectoryHandle(
+              subDirName,
+              { create: true },
+            );
 
             const fileName = `${Date.now()}_${file.name}`;
-            const fileHandle = await subDirHandle.getFileHandle(fileName, { create: true });
-            
+            const fileHandle = await subDirHandle.getFileHandle(fileName, {
+              create: true,
+            });
+
             const writable = await fileHandle.createWritable();
             await writable.write(file);
             await writable.close();
@@ -1300,10 +1531,32 @@
             return `${subDirName}/${fileName}`;
           } catch (err) {
             console.error("Failed to auto-save file copy:", err);
+            if (err.name === "NotFoundError") {
+              showToast("Folder missing. Please relink.", "error");
+              this.unlinkFolder();
+            }
+            return null;
+          }
+        },
+        // by reading the file from the linked folder. Needed because blob: URLs
+        // don't survive a page reload — the disk copy is the source of truth.
+        getFileURL: async function(relativePath) {
+          if (!this.dirHandle || !relativePath) return null;
+          try {
+            const hasPerm = await this.verifyPermission(this.dirHandle, false);
+            if (!hasPerm) return null;
+            const [subDirName, fileName] = relativePath.split("/");
+            const subDirHandle = await this.dirHandle.getDirectoryHandle(subDirName);
+            const fileHandle = await subDirHandle.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+            return URL.createObjectURL(file);
+          } catch (err) {
+            console.warn("Could not re-resolve saved file:", relativePath, err);
             return null;
           }
         }
       };
+
       let state = {
         entries: [],
         clients: [],
@@ -1729,6 +1982,7 @@
       const UI = {
         init: () => {
           Storage.load();
+          DirectoryStore.restore();
           Dialog.init();
           setSaveStatus("saved");
           if (!window.showSaveFilePicker) {
@@ -1929,6 +2183,7 @@
             </div>
         `;
           container.innerHTML = html;
+          reviveSavedImages(container);
         },
 
         // --- Client Editor (Redesigned to match image) ---
@@ -2377,15 +2632,24 @@
           Handlers._isPdfUploading = true;
 
           try {
-            // 1. Auto-copy ke folder lokal jika directory terhubung
-            if (DirectoryStore && DirectoryStore.dirHandle) {
-              const savedPath = await DirectoryStore.saveFileToDirectory(
-                file,
-                "pdf",
-              );
-              if (savedPath) {
-                showToast(`Saved copy to folder: ${savedPath}`, "info");
+            // Mandatory Link Folder Check
+            if (!DirectoryStore.dirHandle) {
+              const linked = await DirectoryStore.linkFolder();
+              if (!linked) {
+                showToast("Folder link is mandatory to upload files.", "error");
+                input.value = "";
+                Handlers._isPdfUploading = false;
+                return;
               }
+            }
+
+            // 1. Auto-copy ke folder lokal
+            const savedPath = await DirectoryStore.saveFileToDirectory(
+              file,
+              "pdf",
+            );
+            if (savedPath) {
+              showToast(`Saved copy to folder: ${savedPath}`, "info");
             }
 
             // 2. Peringatan ukuran file (> 5MB)
@@ -2418,6 +2682,18 @@
           const clientId = event.target.dataset.clientId;
           const key = event.target.dataset.key;
           if (!file || !clientId || !key) return;
+
+          // Mandatory Link Folder Check
+          if (!DirectoryStore.dirHandle) {
+            const linked = await DirectoryStore.linkFolder();
+            if (!linked) {
+              showToast("Folder link is mandatory to upload files.", "error");
+              event.target.value = "";
+              return;
+            }
+          }
+
+          await DirectoryStore.saveFileToDirectory(file, "pdf");
 
           if (file.size > 5 * 1024 * 1024) {
             showToast(
@@ -2476,10 +2752,10 @@
 
       const CLICK_ACTIONS = {
         toggleTheme: () => toggleTheme(),
-        toggleTheme: () => toggleTheme(),
-        showSettings: () => UI.showSettingsModal(),
+        showSettings: () => UI.showSettings(),
         newGeneralTool: () => Handlers.newGeneralTool(),
-        openStorageFolder: () => DirectoryStore.openStorageFolder(),
+        manageStorage: () => DirectoryStore.manageStorage(),
+        unlinkStorage: () => DirectoryStore.unlinkFolder(),
         toggleCheckzer: () => UI.toggleCheckzer(),
         showHistory: () => UI.showHistory(),
         deleteCurrent: () => UI.deleteCurrent(),
@@ -2558,7 +2834,14 @@
           ),
         renderLinkedLogs: (el) => UI.renderLinkedLogs(el.dataset.id, el.value),
         updateSettings: () => updateSettings(),
-        handleImageUpload: (el, event) => handleImageUpload(event),
+        handleImageUpload: (el, event) => {
+          // Same guard as PDF uploads above — this input's "change" event fires
+          // twice in this environment; stopImmediatePropagation stops the second
+          // firing from re-triggering the handler and double-saving the file.
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+          handleImageUpload(event);
+        },
         handlePdfUpload: (el, event) => Handlers.handlePdfUpload(event),
         handleChecklistPdfUpload: (el, event) =>
           Handlers.handleChecklistPdfUpload(event),
@@ -2578,6 +2861,8 @@
         document.addEventListener("input", (event) => {
           const target = event.target.closest("[data-action]");
           if (!target) return;
+          if (target.type === "file") return; // file inputs fire both "input" and
+          // "change" — only handle it once, via "change"
           const fn = FIELD_ACTIONS[target.dataset.action];
           if (fn) fn(target, event);
         });
@@ -2626,10 +2911,24 @@
           .replace(/'/g, "&#039;");
       }
 
-      function handleImageUpload(e) {
+      async function handleImageUpload(e) {
         const file = e.target.files[0];
         if (!file) return;
-        processImageFile(file);
+
+        if (!DirectoryStore.dirHandle) {
+          const linked = await DirectoryStore.linkFolder();
+          if (!linked) {
+            showToast("Folder link is mandatory to upload files.", "error");
+            e.target.value = "";
+            return;
+          }
+        }
+
+        const savedPath = await DirectoryStore.saveFileToDirectory(
+          file,
+          "image",
+        );
+        insertImageReference(file, savedPath);
         e.target.value = "";
       }
 
@@ -2645,18 +2944,33 @@
         }
       }
 
-      function processImageFile(file) {
-        if (file.size > MAX_IMAGE_SIZE)
-          showToast("Image is >2MB. Watch storage quota.", "error");
-        const reader = new FileReader();
-        reader.onload = function (event) {
-          document.execCommand(
-            "insertHTML",
-            false,
-            `<img src="${event.target.result}" alt="pasted image" />`,
+      async function processImageFile(file) {
+        let savedPath = null;
+        if (DirectoryStore.dirHandle) {
+          savedPath = await DirectoryStore.saveFileToDirectory(file, "image");
+        }
+        insertImageReference(file, savedPath);
+      }
+
+      // Inserts ONE lightweight preview (a blob: URL, not a base64 copy) into the doc.
+      // The permanent copy lives on disk via saveFileToDirectory — this is what stops
+      // the image being stored twice (once on disk, once again as base64 in localStorage).
+      function insertImageReference(file, savedPath) {
+        const blobUrl = URL.createObjectURL(file);
+        document.execCommand(
+          "insertHTML",
+          false,
+          `<img src="${blobUrl}" data-saved-path="${savedPath || ""}" alt="${escapeHtml(file.name)}" />`,
+        );
+
+        if (savedPath) {
+          showToast(`Saved image to folder: ${savedPath}`, "info");
+        } else {
+          showToast(
+            "Folder isn't linked properly — check your link, or this image won't be saved after reload.",
+            "error",
           );
-        };
-        reader.readAsDataURL(file);
+        }
       }
 
       // --- Checkzer (AI Analysis) ---
